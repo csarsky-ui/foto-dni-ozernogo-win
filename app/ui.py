@@ -578,6 +578,7 @@ class MainWindow(QMainWindow):
 
         self.btn_save_jpg = QPushButton("JPG")
         self.btn_save_jpg.setMinimumHeight(36)
+        self.btn_save_jpg.setToolTip("Сохранить лист 10×15 в JPG (300 DPI) без логотипа «Дни Озёрного»")
         self.btn_save_jpg.clicked.connect(self.save_jpeg)
         self.btn_save_jpg.setEnabled(False)
 
@@ -860,15 +861,16 @@ class MainWindow(QMainWindow):
         if self.loaded_photo is None:
             return
         default_path = str(self.loaded_photo.path.parent / f"{self._suggested_base_name()}.jpg")
-        out_str, _ = QFileDialog.getSaveFileName(self, "Сохранить JPEG на печать (10×15 см, 300 DPI)", default_path, "JPEG (*.jpg *.jpeg)")
+        out_str, _ = QFileDialog.getSaveFileName(self, "Сохранить JPEG без логотипа (10×15 см, 300 DPI)", default_path, "JPEG (*.jpg *.jpeg)")
         if not out_str:
             return
         out_path = Path(out_str)
         try:
-            sheet = self.engine.render_sheet(self.loaded_photo, self.settings)
+            jpg_settings = EditSettings(**self.settings.__dict__)
+            jpg_settings.logo_style = LogoStyle.NONE
+            sheet = self.engine.render_sheet(self.loaded_photo, jpg_settings)
             self.engine.export_jpeg(sheet, out_path)
-            self.current_sheet = sheet
-            self.lbl_status.setText(f"JPEG сохранён: {out_path.name} (10×15 см, 300 DPI, sRGB)")
+            self.lbl_status.setText(f"JPEG сохранён без логотипа: {out_path.name} (10×15 см, 300 DPI, sRGB)")
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка сохранения JPEG", str(exc))
 

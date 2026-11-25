@@ -185,7 +185,8 @@ class PhotoEngine:
             lum_r = 0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]
             sh_lift = np.power(np.clip(1.0 - lum_r, 0.0, 1.0), 2.2) * 0.06
             img_f = img_f + sh_lift[..., None] * (1.0 - img_f)
-            img_f = np.where(img_f > 0.90, 0.90 + (img_f - 0.90) / (1.0 + (img_f - 0.90) * 1.5), img_f)
+            over = np.maximum(0.0, img_f - 0.90)
+            img_f = np.where(img_f > 0.90, 0.90 + over / (1.0 + over * 1.5), img_f)
             img_rgb = np.clip(img_f * 255.0, 0, 255).astype(np.uint8)
         else:
             pil = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
@@ -220,6 +221,39 @@ class PhotoEngine:
         # Pass 2: Full RMBG-1.4 alpha matte + refined MediaPipe landmarks on leveled image
         raw_mask = self._run_rmbg_mask(leveled_rgb)
         lms2 = self._detect_landmarks(leveled_rgb)
+
+        # High-resolution Portrait-ROI second pass for wide/landscape frames so ears, temples & hair get 2x-3x resolution
+        if lms2 is not None:
+            xs = [p.x for p in lms2]
+            ys = [p.y for p in lms2]
+            fw_norm = max(xs) - min(xs)
+            fh_norm = max(ys) - min(ys)
+            if fw_norm < 0.46:
+                fcx = (min(xs) + max(xs)) * 0.5 * W
+                fcy = (min(ys) + max(ys)) * 0.5 * H
+                roi_w = min(W, int(round(fw_norm * W * 3.4)))
+                roi_h = min(H, int(round(fh_norm * H * 4.4)))
+                rx0 = max(0, min(W - roi_w, int(round(fcx - roi_w * 0.5))))
+                ry0 = max(0, min(H - roi_h, int(round(fcy - roi_h * 0.38))))
+                rx1, ry1 = rx0 + roi_w, ry0 + roi_h
+                if roi_w >= 256 and roi_h >= 256:
+                    roi_mask = self._run_rmbg_mask(leveled_rgb[ry0:ry1, rx0:rx1])
+                    # Softly blend ROI edges (24px) into full-frame mask so zooming out never shows a seam
+                    fe = min(24, roi_w // 8, roi_h // 8)
+                    wy = np.ones(roi_h, dtype=np.float32)
+                    wx = np.ones(roi_w, dtype=np.float32)
+                    if fe > 1:
+                        ramp = np.linspace(0.0, 1.0, fe, dtype=np.float32)
+                        if ry0 > 0:
+                            wy[:fe] = ramp
+                        if ry1 < H:
+                            wy[-fe:] = ramp[::-1]
+                        if rx0 > 0:
+                            wx[:fe] = ramp
+                        if rx1 < W:
+                            wx[-fe:] = ramp[::-1]
+                    w2d = wy[:, None] * wx[None, :]
+                    raw_mask[ry0:ry1, rx0:rx1] = roi_mask * w2d + raw_mask[ry0:ry1, rx0:rx1] * (1.0 - w2d)
 
         metrics = self._build_face_metrics(lms2, raw_mask, W, H, eye_roll_rad)
         auto_temp, auto_tint = self._estimate_backdrop_wb(leveled_rgb, raw_mask)
@@ -431,10 +465,12 @@ class PhotoEngine:
         crop_rgb = cv2.resize(src_rgb[y0:y1, x0:x1], (work_w, work_h), interpolation=cv2.INTER_LANCZOS4).astype(np.float32) / 255.0
         crop_mask = cv2.resize(src_mask[y0:y1, x0:x1], (work_w, work_h), interpolation=cv2.INTER_LINEAR)
 
-        # Refine mask curve (clean pure white background while preserving natural hair wisps)
-        lo = 0.04 + settings.mask_clean_strength * 0.12
-        hi = 0.96 - settings.mask_clean_strength * 0.08
-        clean_mask = np.clip((crop_mask - lo) / max(0.05, hi - lo), 0.0, 1.0)
+        # Edge-guided 3-channel RGB Guided Filter (He et al. 2013): snaps ears, temples, collar & epaulettes
+        # cleanly onto true RGB edges while preserving natural hair wisps and locking pure white/interior!
+        if settings.white_background:
+            clean_mask = self._refine_mask_rgb_guided(crop_rgb, crop_mask, settings.mask_clean_strength)
+        else:
+            clean_mask = np.ones((work_h, work_w), dtype=np.float32)
 
         # Global White Balance (Auto WB + user fine-tuning)
         temp_shift = (photo.auto_temp_delta if settings.auto_wb else 0.0) + settings.temp_shift
@@ -526,6 +562,73 @@ class PhotoEngine:
             eye_line_mm=actual_eye_line_mm,
             red_eye_fixed_pixels=red_eye_px,
         )
+
+    @staticmethod
+    def _refine_mask_rgb_guided(
+        rgb01: np.ndarray, raw_mask: np.ndarray, clean_strength: float
+    ) -> np.ndarray:
+        """
+        Boundary-banded 3-channel RGB Guided Filter (He et al. 2013).
+        Refines soft neural matte boundaries along ears, temples, collar and shoulders using the
+        crisp 2x portrait RGB edges while locking pure background (0.0) and pure interior (1.0).
+        """
+        h, w = raw_mask.shape[:2]
+        r = max(6, min(18, int(round(w * 0.011))))
+        k = (2 * r + 1, 2 * r + 1)
+        eps = 2.2e-4
+
+        ir = np.ascontiguousarray(rgb01[:, :, 0], dtype=np.float32)
+        ig = np.ascontiguousarray(rgb01[:, :, 1], dtype=np.float32)
+        ib = np.ascontiguousarray(rgb01[:, :, 2], dtype=np.float32)
+        p = np.ascontiguousarray(np.clip(raw_mask, 0.0, 1.0), dtype=np.float32)
+
+        mean_ir = cv2.boxFilter(ir, -1, k)
+        mean_ig = cv2.boxFilter(ig, -1, k)
+        mean_ib = cv2.boxFilter(ib, -1, k)
+        mean_p = cv2.boxFilter(p, -1, k)
+
+        cov_r = cv2.boxFilter(ir * p, -1, k) - mean_ir * mean_p
+        cov_g = cv2.boxFilter(ig * p, -1, k) - mean_ig * mean_p
+        cov_b = cv2.boxFilter(ib * p, -1, k) - mean_ib * mean_p
+
+        vrr = cv2.boxFilter(ir * ir, -1, k) - mean_ir * mean_ir + eps
+        vrg = cv2.boxFilter(ir * ig, -1, k) - mean_ir * mean_ig
+        vrb = cv2.boxFilter(ir * ib, -1, k) - mean_ir * mean_ib
+        vgg = cv2.boxFilter(ig * ig, -1, k) - mean_ig * mean_ig + eps
+        vgb = cv2.boxFilter(ig * ib, -1, k) - mean_ig * mean_ib
+        vbb = cv2.boxFilter(ib * ib, -1, k) - mean_ib * mean_ib + eps
+
+        inv_rr = vgg * vbb - vgb * vgb
+        inv_rg = vgb * vrb - vrg * vbb
+        inv_rb = vrg * vgb - vgg * vrb
+        inv_gg = vrr * vbb - vrb * vrb
+        inv_gb = vrg * vrb - vrr * vgb
+        inv_bb = vrr * vgg - vrg * vrg
+        det = np.maximum(1e-12, vrr * inv_rr + vrg * inv_rg + vrb * inv_rb)
+
+        ar = (inv_rr * cov_r + inv_rg * cov_g + inv_rb * cov_b) / det
+        ag = (inv_rg * cov_r + inv_gg * cov_g + inv_gb * cov_b) / det
+        ab = (inv_rb * cov_r + inv_gb * cov_g + inv_bb * cov_b) / det
+        b = mean_p - ar * mean_ir - ag * mean_ig - ab * mean_ib
+
+        q = (
+            cv2.boxFilter(ar, -1, k) * ir
+            + cv2.boxFilter(ag, -1, k) * ig
+            + cv2.boxFilter(ab, -1, k) * ib
+            + cv2.boxFilter(b, -1, k)
+        )
+
+        # Smooth matte stretch inside the edge band; keep pure exterior=0 and pure interior=1 locked
+        s = float(max(0.0, min(1.0, clean_strength)))
+        lo = 0.06 + s * 0.12
+        hi = 0.94 - s * 0.08
+        stretched = np.clip((q - lo) / max(0.05, hi - lo), 0.0, 1.0)
+
+        kb = (2 * (r + 4) + 1, 2 * (r + 4) + 1)
+        band_p = cv2.boxFilter(p, -1, kb)
+        stretched = np.where((band_p < 0.004) & (p < 0.02), 0.0, stretched)
+        stretched = np.where((band_p > 0.996) & (p > 0.98), 1.0, stretched)
+        return stretched.astype(np.float32)
 
     def _apply_designer_retouch(
         self,
