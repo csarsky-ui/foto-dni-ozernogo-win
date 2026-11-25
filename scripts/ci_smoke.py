@@ -56,6 +56,7 @@ def main() -> int:
         make_synthetic_portrait(src)
 
         if args.phase == "pre":
+            import os
             from app.engine import PhotoEngine
             from app.models import EditSettings, PhotoFormatPreset
 
@@ -66,6 +67,37 @@ def main() -> int:
             eng.export_psd(sheet, st, out_psd)
             eng.export_jpeg(sheet, out_jpg)
             verify_outputs(out_psd, out_jpg)
+
+            # Also verify async PySide6 MainWindow.load_file() + QThread render end-to-end!
+            os.environ["QT_QPA_PLATFORM"] = "offscreen"
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QApplication
+            from app.ui import MainWindow
+
+            qt_app = QApplication.instance() or QApplication([])
+            win = MainWindow()
+            state = {"rendered": False, "error": None}
+            orig_render = win._on_render_done
+            orig_fail = win._on_photo_failed
+
+            def on_render(*a):
+                orig_render(*a)
+                state["rendered"] = True
+                qt_app.quit()
+
+            def on_fail(err):
+                state["error"] = err
+                qt_app.quit()
+
+            win._on_render_done = on_render
+            win._on_photo_failed = on_fail
+            QTimer.singleShot(30000, qt_app.quit)
+            win.load_file(src)
+            qt_app.exec()
+            win.close()
+            assert state["error"] is None, f"GUI load failed: {state['error']}"
+            assert state["rendered"], "GUI load_file() timed out before rendering!"
+            print("GUI ASYNC LOAD + RENDER OK")
         else:
             if not args.exe or not args.exe.is_file():
                 raise FileNotFoundError(f"Built EXE not found: {args.exe}")

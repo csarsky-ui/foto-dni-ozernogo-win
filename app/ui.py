@@ -67,29 +67,38 @@ def rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-class _LoadWorker(QObject):
-    finished = Signal(object)
+class _LoadThread(QThread):
+    loaded_ok = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
 
-    def __init__(self, engine: PhotoEngine, path: Path) -> None:
-        super().__init__()
+    def __init__(self, engine: PhotoEngine, path: Path, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
         self.engine = engine
         self.path = path
 
     def run(self) -> None:
         try:
-            loaded = self.engine.load_photo(self.path)
-            self.finished.emit(loaded)
+            loaded = self.engine.load_photo(self.path, progress_cb=self.progress.emit)
+            self.loaded_ok.emit(loaded)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class _RenderWorker(QObject):
-    finished = Signal(int, str, object)  # gen, mode, RenderedSheet | PortraitPreviewResult
+class _RenderThread(QThread):
+    rendered_ok = Signal(int, str, object)  # gen, mode, RenderedSheet | PortraitPreviewResult
     failed = Signal(int, str)
 
-    def __init__(self, engine: PhotoEngine, gen: int, mode: str, photo: LoadedPhoto, settings: EditSettings) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        engine: PhotoEngine,
+        gen: int,
+        mode: str,
+        photo: LoadedPhoto,
+        settings: EditSettings,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
         self.engine = engine
         self.gen = gen
         self.mode = mode
@@ -102,7 +111,7 @@ class _RenderWorker(QObject):
                 res = self.engine.render_sheet(self.photo, self.settings)
             else:
                 res = self.engine.render_closeup_portrait(self.photo, self.settings)
-            self.finished.emit(self.gen, self.mode, res)
+            self.rendered_ok.emit(self.gen, self.mode, res)
         except Exception as exc:
             self.failed.emit(self.gen, str(exc))
 
@@ -720,18 +729,17 @@ class MainWindow(QMainWindow):
         self.canvas.set_loading(f"Декодирую {path.name} и строю AI-маску…")
         self.lbl_status.setText(f"Загрузка {path.name}…")
 
-        thread = QThread(self)
-        worker = _LoadWorker(self.engine, path)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_photo_loaded)
-        worker.failed.connect(self._on_photo_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._cleanup_thread(thread))
+        thread = _LoadThread(self.engine, path, parent=self)
+        thread.progress.connect(self._on_load_progress)
+        thread.loaded_ok.connect(self._on_photo_loaded)
+        thread.failed.connect(self._on_photo_failed)
+        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
         self._active_threads.append(thread)
         thread.start()
+
+    def _on_load_progress(self, msg: str) -> None:
+        self.canvas.set_loading(msg)
+        self.lbl_status.setText(msg)
 
     def _on_photo_loaded(self, loaded: LoadedPhoto) -> None:
         self.loaded_photo = loaded
@@ -764,16 +772,10 @@ class MainWindow(QMainWindow):
         gen = self._render_gen
         # Snapshot dataclass copy for thread safety
         snap = EditSettings(**self.settings.__dict__)
-        thread = QThread(self)
-        worker = _RenderWorker(self.engine, gen, self.preview_mode, self.loaded_photo, snap)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_render_done)
-        worker.failed.connect(self._on_render_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._cleanup_thread(thread))
+        thread = _RenderThread(self.engine, gen, self.preview_mode, self.loaded_photo, snap, parent=self)
+        thread.rendered_ok.connect(self._on_render_done)
+        thread.failed.connect(self._on_render_failed)
+        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
         self._active_threads.append(thread)
         thread.start()
 
@@ -831,6 +833,12 @@ class MainWindow(QMainWindow):
         if thread in self._active_threads:
             self._active_threads.remove(thread)
         thread.deleteLater()
+
+    def closeEvent(self, event) -> None:
+        for t in list(self._active_threads):
+            if t.isRunning():
+                t.wait(5000)
+        super().closeEvent(event)
 
     # MARK: - Export & Printing
     def _suggested_base_name(self) -> str:
