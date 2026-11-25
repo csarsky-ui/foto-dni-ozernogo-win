@@ -77,6 +77,7 @@ class RenderedTilePack:
     right_eye_mm: float
     eye_line_mm: float
     red_eye_fixed_pixels: int
+    pimples_fixed_count: int = 0
 
 
 @dataclass
@@ -95,6 +96,7 @@ class RenderedSheet:
     primary_right_eye_mm: float
     primary_eye_line_mm: float
     red_eye_fixed_pixels: int
+    pimples_fixed_count: int = 0
 
 
 @dataclass
@@ -106,6 +108,7 @@ class PortraitPreviewResult:
     right_eye_mm: float
     eye_line_mm: float
     red_eye_fixed_pixels: int
+    pimples_fixed_count: int = 0
 
 
 class PhotoEngine:
@@ -528,13 +531,15 @@ class PhotoEngine:
 
         # Designer Studio Portrait Retouching (Vectorized NumPy — fast & razor-accurate!)
         red_eye_px = 0
+        pimples_fixed = 0
         if m.detected_face and (
             settings.de_shine > 0.01
             or settings.red_eye_fix
+            or settings.pimple_fix
             or settings.skin_tone_polish > 0.01
             or settings.skin_retouch > 0.01
         ):
-            work_u8, red_eye_px = self._apply_designer_retouch(
+            work_u8, red_eye_px, pimples_fixed = self._apply_designer_retouch(
                 rgb=work_u8,
                 fg_mask=clean_mask,
                 crop_left=crop_left,
@@ -576,6 +581,7 @@ class PhotoEngine:
             right_eye_mm=actual_right_eye_mm,
             eye_line_mm=actual_eye_line_mm,
             red_eye_fixed_pixels=red_eye_px,
+            pimples_fixed_count=pimples_fixed,
         )
 
     @staticmethod
@@ -655,7 +661,7 @@ class PhotoEngine:
         crop_h: float,
         metrics: FaceMetrics,
         settings: EditSettings,
-    ) -> Tuple[np.ndarray, int]:
+    ) -> Tuple[np.ndarray, int, int]:
         out = rgb.copy()
         work_h, work_w = out.shape[:2]
         sx = work_w / crop_w
@@ -728,11 +734,38 @@ class PhotoEngine:
         roi_y0 = max(0, int(face_cy - face_ry * 1.25))
         roi_y1 = min(work_h, int(face_cy + face_ry * 1.35) + 1)
         if roi_x1 - roi_x0 < 16 or roi_y1 - roi_y0 < 16:
-            return out, red_eye_fixed
+            return out, red_eye_fixed, 0
 
         roi = out[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float32)
         roi_fg = fg_mask[roi_y0:roi_y1, roi_x0:roi_x1]
         yy, xx = np.mgrid[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float32)
+
+        # 1b. Surgical Automatic Pimple Removal (BEFORE smoothing/skin-tone polish so erythema contrast is cleanest!)
+        pimples_fixed = 0
+        if settings.pimple_fix:
+            p_valid = (
+                ((((xx - face_cx) / (face_rx * 0.94)) ** 2 + ((yy - face_cy) / (face_ry * 1.02)) ** 2) < 1.0)
+                & (roi_fg > 0.82)
+            )
+            for eye in [p for p in (le_pt, re_pt) if p is not None]:
+                ex, ey = eye
+                p_valid &= (((xx - ex) / (eye_r * 1.38)) ** 2 + ((yy - ey) / (eye_r * 1.05)) ** 2) > 1.0
+                p_valid &= (((xx - ex) / (eye_r * 1.58)) ** 2 + ((yy - (ey - eye_r * 0.95)) / (eye_r * 0.62)) ** 2) > 1.0
+            p_valid &= (((xx - mouth_cx) / (mouth_rx * 1.08)) ** 2 + ((yy - mouth_cy) / (mouth_ry * 1.12)) ** 2) > 1.0
+            if metrics.nose_rect:
+                nx, ny, nw, nh = metrics.nose_rect
+                nr_x0 = (nx - crop_left) * sx - nw * sx * 0.35
+                nr_x1 = (nx + nw - crop_left) * sx + nw * sx * 0.35
+                nr_y0 = (ny - crop_top) * sy + nh * sy * 0.48
+                nr_y1 = (ny + nh - crop_top) * sy + nh * sy * 0.22
+                p_valid &= ~((xx >= nr_x0) & (xx <= nr_x1) & (yy >= nr_y0) & (yy <= nr_y1))
+
+            lum0 = 0.299 * roi[:, :, 0] + 0.587 * roi[:, :, 1] + 0.114 * roi[:, :, 2]
+            p_valid &= (lum0 > 82.0) & (roi[:, :, 0] >= roi[:, :, 1] - 4.0) & (roi[:, :, 1] >= roi[:, :, 2] - 4.0)
+            roi_u8 = np.clip(np.rint(roi), 0, 255).astype(np.uint8)
+            healed_u8, pimples_fixed = self._detect_and_heal_pimples(roi_u8, p_valid, face_rx)
+            if pimples_fixed > 0:
+                roi = healed_u8.astype(np.float32)
 
         def smoothstep(e0: float, e1: float, val: np.ndarray) -> np.ndarray:
             t = np.clip((val - e0) / (e1 - e0), 0.0, 1.0)
@@ -819,7 +852,138 @@ class PhotoEngine:
             roi = roi * (1.0 - t_blend) + ideal * t_blend
 
         out[roi_y0:roi_y1, roi_x0:roi_x1] = np.clip(np.rint(roi), 0, 255).astype(np.uint8)
-        return out, red_eye_fixed
+        return out, red_eye_fixed, pimples_fixed
+
+    @staticmethod
+    def _detect_and_heal_pimples(
+        roi_u8: np.ndarray, valid_skin: np.ndarray, face_rx: float
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Detects ONLY clearly defined localized inflamed pimples (papules & whiteheads in red halo)
+        using surround-ring CIE-Lab a* + illumination-invariant erythema contrast. Preserves moles & pores.
+        Heals via seamless Laplace harmonic diffusion + adjacent skin pore micro-texture graft.
+        """
+        h, w = roi_u8.shape[:2]
+        out = roi_u8.astype(np.float32).copy()
+
+        lab = cv2.cvtColor(roi_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        L, a_ch = lab[:, :, 0], lab[:, :, 1]
+        ery = (out[:, :, 0] - out[:, :, 1]) / (out[:, :, 0] + out[:, :, 1] + 20.0)
+
+        bg_r = max(7, int(round(face_rx * 0.11)))
+        bg_k = bg_r * 2 + 1
+        a_bg = cv2.GaussianBlur(a_ch, (bg_k, bg_k), bg_r * 0.42)
+        L_bg = cv2.GaussianBlur(L, (bg_k, bg_k), bg_r * 0.42)
+        ery_bg = cv2.GaussianBlur(ery, (bg_k, bg_k), bg_r * 0.42)
+
+        a_sm = cv2.GaussianBlur(a_ch, (3, 3), 0.7)
+        L_sm = cv2.GaussianBlur(L, (3, 3), 0.7)
+        ery_sm = cv2.GaussianBlur(ery, (3, 3), 0.7)
+
+        da = a_sm - a_bg
+        dery = ery_sm - ery_bg
+        dL = L_bg - L_sm
+
+        cand = valid_skin & (da > 4.6) & (dery > 0.028) & ~((dL > 30.0) & (da < 10.0))
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        close_r = max(2, int(round(face_rx * 0.015)))
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_r * 2 + 1, close_r * 2 + 1))
+        cand_u8 = cv2.morphologyEx(cand.astype(np.uint8) * 255, cv2.MORPH_OPEN, k3)
+        cand_u8 = cv2.morphologyEx(cand_u8, cv2.MORPH_CLOSE, k_close)
+
+        n_lbl, labels, stats, centroids = cv2.connectedComponentsWithStats(cand_u8, connectivity=8)
+
+        face_w = face_rx * 2.0
+        min_d = max(4.0, face_w * 0.012)
+        max_d = max(14.0, face_w * 0.075)
+        min_area = math.pi * (min_d * 0.5) ** 2 * 0.45
+        max_area = math.pi * (max_d * 0.5) ** 2 * 1.25
+
+        detected: List[Tuple[float, float, int, int]] = []
+        for l in range(1, n_lbl):
+            area = float(stats[l, cv2.CC_STAT_AREA])
+            bw = int(stats[l, cv2.CC_STAT_WIDTH])
+            bh = int(stats[l, cv2.CC_STAT_HEIGHT])
+            if area < min_area or area > max_area:
+                continue
+            if max(bw, bh) / max(1.0, min(bw, bh)) > 2.2:
+                continue
+            if area / float(max(1, bw * bh)) < 0.34:
+                continue
+
+            cx, cy = float(centroids[l][0]), float(centroids[l][1])
+            rad = max(3.5, math.sqrt(area / math.pi))
+            pad = int(math.ceil(rad * 2.8)) + 2
+            x0, x1 = max(0, int(cx) - pad), min(w, int(cx) + pad + 1)
+            y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
+            py, px = np.mgrid[y0:y1, x0:x1]
+            dist = np.hypot(px - cx, py - cy)
+
+            in_red = (labels[y0:y1, x0:x1] == l) & cand[y0:y1, x0:x1]
+            if int(in_red.sum()) < 6:
+                continue
+            ring_m = (dist >= rad * 1.45) & (dist <= rad * 2.55) & valid_skin[y0:y1, x0:x1] & (cand_u8[y0:y1, x0:x1] == 0)
+            if int(ring_m.sum()) < 18:
+                continue
+
+            ring_a = float(np.median(a_sm[y0:y1, x0:x1][ring_m]))
+            ring_ery = float(np.median(ery_sm[y0:y1, x0:x1][ring_m]))
+            ring_L = float(np.median(L_sm[y0:y1, x0:x1][ring_m]))
+
+            in_a_vals = a_sm[y0:y1, x0:x1][in_red]
+            in_e_vals = ery_sm[y0:y1, x0:x1][in_red]
+            in_L_vals = L_sm[y0:y1, x0:x1][in_red]
+
+            p90_da = float(np.percentile(in_a_vals, 90)) - ring_a
+            mean_da = float(in_a_vals.mean()) - ring_a
+            p90_dE = float(np.percentile(in_e_vals, 90)) - ring_ery
+            mean_dL = ring_L - float(in_L_vals.mean())
+
+            if p90_da >= 8.2 and mean_da >= 5.8 and p90_dE >= 0.052 and not (mean_dL > 28.0 and p90_da < 13.0):
+                rx_e = max(5, int(round(max(bw * 0.78, rad * 1.65))))
+                ry_e = max(5, int(round(max(bh * 0.78, rad * 1.65))))
+                detected.append((cx, cy, rx_e, ry_e))
+
+        if not detected:
+            return roi_u8, 0
+
+        tex_k = max(3, int(round(face_rx * 0.035)) * 2 + 1)
+        high_orig = out - cv2.GaussianBlur(out, (tex_k, tex_k), 0)
+
+        heal_bin = np.zeros((h, w), dtype=np.uint8)
+        for (cx, cy, rx_e, ry_e) in detected:
+            cv2.ellipse(heal_bin, (int(round(cx)), int(round(cy))), (rx_e, ry_e), 0, 0, 360, 255, -1)
+        heal_bin = np.where(valid_skin, heal_bin, 0).astype(np.uint8)
+
+        healed_low = out.copy()
+        for (cx, cy, rx_e, ry_e) in detected:
+            pad = max(rx_e, ry_e) + 8
+            x0, x1 = max(1, int(cx) - pad), min(w - 1, int(cx) + pad + 1)
+            y0, y1 = max(1, int(cy) - pad), min(h - 1, int(cy) + pad + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            sub_m = heal_bin[y0:y1, x0:x1] > 0
+            if not sub_m.any():
+                continue
+            patch = healed_low[y0 - 1 : y1 + 1, x0 - 1 : x1 + 1].copy()
+            ring = (~sub_m) & valid_skin[y0:y1, x0:x1]
+            if ring.any():
+                patch[1:-1, 1:-1][sub_m] = np.median(patch[1:-1, 1:-1][ring], axis=0)
+            for _ in range(40):
+                avg4 = 0.25 * (patch[:-2, 1:-1] + patch[2:, 1:-1] + patch[1:-1, :-2] + patch[1:-1, 2:])
+                patch[1:-1, 1:-1] = np.where(sub_m[..., None], avg4, patch[1:-1, 1:-1])
+            healed_low[y0:y1, x0:x1] = patch[1:-1, 1:-1]
+
+        shift = max(8, int(round(face_rx * 0.07)))
+        donor_high = np.roll(high_orig, shift=shift, axis=1)
+        donor_ok = np.roll(valid_skin & (heal_bin == 0), shift=shift, axis=1)
+        healed_tex = np.clip(healed_low + np.where(donor_ok[..., None], donor_high * 0.50, 0.0), 0.0, 255.0)
+
+        feather_r = max(3, int(round(face_rx * 0.016)))
+        alpha = cv2.GaussianBlur(heal_bin.astype(np.float32) / 255.0, (feather_r * 2 + 1, feather_r * 2 + 1), 0)
+        alpha = np.clip(alpha * 1.15, 0.0, 0.95)
+        res = out * (1.0 - alpha[..., None]) + healed_tex * alpha[..., None]
+        return np.clip(np.rint(res), 0, 255).astype(np.uint8), len(detected)
 
     # MARK: - 3. Render Complete Vertical 10x15 Sheet
     def render_sheet(self, photo: LoadedPhoto, settings: EditSettings) -> RenderedSheet:
@@ -844,6 +1008,7 @@ class PhotoEngine:
                     right_eye_mm=ex.right_eye_mm,
                     eye_line_mm=ex.eye_line_mm,
                     red_eye_fixed_pixels=ex.red_eye_fixed_pixels,
+                    pimples_fixed_count=ex.pimples_fixed_count,
                 ))
             else:
                 pack = self.render_tile(photo, pt, settings)
@@ -930,6 +1095,7 @@ class PhotoEngine:
             primary_right_eye_mm=first.right_eye_mm if first else 0.0,
             primary_eye_line_mm=first.eye_line_mm if first else 0.0,
             red_eye_fixed_pixels=first.red_eye_fixed_pixels if first else 0,
+            pimples_fixed_count=first.pimples_fixed_count if first else 0,
         )
 
     def render_closeup_portrait(self, photo: LoadedPhoto, settings: EditSettings) -> PortraitPreviewResult:
@@ -955,6 +1121,7 @@ class PhotoEngine:
             right_eye_mm=pack.right_eye_mm,
             eye_line_mm=pack.eye_line_mm,
             red_eye_fixed_pixels=pack.red_eye_fixed_pixels,
+            pimples_fixed_count=pack.pimples_fixed_count,
         )
 
     # MARK: - 4. Export Layered PSD & 300 DPI sRGB JPEG

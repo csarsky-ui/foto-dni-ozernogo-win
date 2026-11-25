@@ -319,6 +319,7 @@ class EditSettings:
     # Designer Portrait Retouch
     de_shine: float = 0.55
     red_eye_fix: bool = True
+    pimple_fix: bool = True
     skin_tone_polish: float = 0.45
     skin_retouch: float = 0.35
 
@@ -338,6 +339,7 @@ class EditSettings:
         self.shadow_lift = 0.16
         self.de_shine = 0.55
         self.red_eye_fix = True
+        self.pimple_fix = True
         self.skin_tone_polish = 0.45
         self.skin_retouch = 0.35
         self.mask_clean_strength = 0.50

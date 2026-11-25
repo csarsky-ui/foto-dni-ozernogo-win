@@ -474,6 +474,14 @@ class MainWindow(QMainWindow):
         self.lbl_redeye_status.setStyleSheet("color: #666; font-size: 11px;")
         gl.addWidget(self.lbl_redeye_status)
 
+        self.chk_pimples = QCheckBox("Убрать явные прыщи (родинки сохраняются)")
+        self.chk_pimples.setChecked(True)
+        self.chk_pimples.toggled.connect(self._on_controls_changed)
+        gl.addWidget(self.chk_pimples)
+        self.lbl_pimple_status = QLabel("")
+        self.lbl_pimple_status.setStyleSheet("color: #666; font-size: 11px;")
+        gl.addWidget(self.lbl_pimple_status)
+
         self.sl_deshine = self._add_slider(gl, "Убрать блеск (нос/лицо)", 0, 100, 55, lambda v: f"{v}%")
         self.sl_skintone = self._add_slider(gl, "Выровнять скинтон", 0, 100, 45, lambda v: f"{v}%")
         self.sl_retouch = self._add_slider(gl, "Мягко скрыть дефекты", 0, 100, 35, lambda v: f"{v}%")
@@ -668,6 +676,7 @@ class MainWindow(QMainWindow):
         self.settings.mask_clean_strength = self.sl_mask.value() / 100.0
 
         self.settings.red_eye_fix = self.chk_redeye.isChecked()
+        self.settings.pimple_fix = self.chk_pimples.isChecked()
         self.settings.de_shine = self.sl_deshine.value() / 100.0
         self.settings.skin_tone_polish = self.sl_skintone.value() / 100.0
         self.settings.skin_retouch = self.sl_retouch.value() / 100.0
@@ -697,6 +706,7 @@ class MainWindow(QMainWindow):
         self.settings.reset_photo_tweaks()
         self.sl_mask.setValue(50)
         self.chk_redeye.setChecked(True)
+        self.chk_pimples.setChecked(True)
         self.sl_deshine.setValue(55)
         self.sl_skintone.setValue(45)
         self.sl_retouch.setValue(35)
@@ -791,6 +801,7 @@ class MainWindow(QMainWindow):
                 result.primary_left_eye_mm,
                 result.primary_right_eye_mm,
                 result.red_eye_fixed_pixels,
+                result.pimples_fixed_count,
             )
         elif isinstance(result, PortraitPreviewResult):
             tw, th = self.settings.preset.primary_tile_mm
@@ -811,6 +822,7 @@ class MainWindow(QMainWindow):
                 result.left_eye_mm,
                 result.right_eye_mm,
                 result.red_eye_fixed_pixels,
+                result.pimples_fixed_count,
             )
 
     def _on_render_failed(self, gen: int, err: str) -> None:
@@ -818,7 +830,9 @@ class MainWindow(QMainWindow):
             return
         self.lbl_status.setText(f"Ошибка рендеринга: {err}")
 
-    def _update_metrics_ui(self, top_mm: float, head_mm: float, le_mm: float, re_mm: float, red_px: int) -> None:
+    def _update_metrics_ui(
+        self, top_mm: float, head_mm: float, le_mm: float, re_mm: float, red_px: int, pimples_cnt: int = 0
+    ) -> None:
         self.lbl_metrics.setText(f"Верх: {top_mm:.1f} · Голова: {head_mm:.1f} · Глаза: {le_mm:.1f}/{re_mm:.1f} мм")
         if not self.settings.red_eye_fix:
             self.lbl_redeye_status.setText("")
@@ -828,6 +842,15 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_redeye_status.setText("Красные глаза на этом фото не обнаружены")
             self.lbl_redeye_status.setStyleSheet("color: #777; font-size: 11px;")
+
+        if not self.settings.pimple_fix:
+            self.lbl_pimple_status.setText("")
+        elif pimples_cnt > 0:
+            self.lbl_pimple_status.setText(f"✓ Найдено и убрано прыщей: {pimples_cnt}")
+            self.lbl_pimple_status.setStyleSheet("color: #2f7d3a; font-size: 11px;")
+        else:
+            self.lbl_pimple_status.setText("Явных прыщей не обнаружено")
+            self.lbl_pimple_status.setStyleSheet("color: #777; font-size: 11px;")
 
     def _cleanup_thread(self, thread: QThread) -> None:
         if thread in self._active_threads:

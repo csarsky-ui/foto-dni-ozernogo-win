@@ -87,7 +87,7 @@ def run_cli(argv: list[str]) -> int:
         engine.export_jpeg(jpg_sheet, args.jpg)
         lines.append(
             f"JPG OK (no logo): {args.jpg} (top={jpg_sheet.primary_headroom_mm:.1f}mm, head={jpg_sheet.primary_head_mm:.1f}mm, "
-            f"eyes={jpg_sheet.primary_left_eye_mm:.1f}/{jpg_sheet.primary_right_eye_mm:.1f}mm, redEyePx={jpg_sheet.red_eye_fixed_pixels})"
+            f"eyes={jpg_sheet.primary_left_eye_mm:.1f}/{jpg_sheet.primary_right_eye_mm:.1f}mm, redEyePx={jpg_sheet.red_eye_fixed_pixels}, pimples={jpg_sheet.pimples_fixed_count})"
         )
     if args.portrait:
         p = engine.render_closeup_portrait(loaded, settings)
