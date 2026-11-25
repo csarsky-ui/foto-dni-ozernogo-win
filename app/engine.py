@@ -674,10 +674,10 @@ class PhotoEngine:
         re_pt = map_pt(metrics.right_eye_center) if metrics.right_eye_center else None
         eye_r = metrics.eye_radius_px * sx
 
-        # 1. Surgical Red-Eye Removal strictly inside exact MediaPipe iris/pupil circles
+        # 1. Surgical Red-Eye Removal strictly inside exact MediaPipe iris/pupil circles (bright & dark-burgundy!)
         red_eye_fixed = 0
         if settings.red_eye_fix:
-            pupil_r = max(5.0, eye_r * 0.50)
+            pupil_r = max(4.0, eye_r * 0.36)
             for eye in [p for p in (le_pt, re_pt) if p is not None]:
                 ex, ey = eye
                 x0 = max(0, int(ex - pupil_r))
@@ -691,15 +691,15 @@ class PhotoEngine:
                 patch = out[y0:y1, x0:x1].astype(np.float32)
                 r, g, b = patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]
                 gb = np.maximum(g, b)
-                is_red = (dist <= pupil_r) & (np.minimum(g, b) < 170.0) & (r > 65.0) & (r > gb * 1.65) & ((r - gb) > 42.0)
+                is_red = (dist <= pupil_r) & (np.minimum(g, b) < 150.0) & (r > 38.0) & (r > gb * 1.62) & ((r - gb) > 22.0)
                 cnt = int(is_red.sum())
                 if cnt > 0:
                     red_eye_fixed += cnt
-                    strength = np.clip((r - gb * 1.45) / 52.0, 0.0, 1.0) * (1.0 - (dist / pupil_r) * 0.15)
-                    target_l = (g * 0.50 + b * 0.50) * 0.35
+                    strength = np.clip((r - gb * 1.35) / 36.0, 0.0, 1.0) * (1.0 - (dist / pupil_r) * 0.15)
+                    target_l = (g * 0.50 + b * 0.50) * 0.40
                     patch[:, :, 0] = np.where(is_red, r * (1.0 - strength) + target_l * strength, r)
-                    patch[:, :, 1] = np.where(is_red, g * (1.0 - strength * 0.45) + target_l * strength * 0.45, g)
-                    patch[:, :, 2] = np.where(is_red, b * (1.0 - strength * 0.45) + target_l * strength * 0.45, b)
+                    patch[:, :, 1] = np.where(is_red, g * (1.0 - strength * 0.35) + target_l * strength * 0.35, g)
+                    patch[:, :, 2] = np.where(is_red, b * (1.0 - strength * 0.35) + target_l * strength * 0.35, b)
                     out[y0:y1, x0:x1] = np.clip(patch, 0, 255).astype(np.uint8)
 
         # Face geometry in working tile pixels
@@ -709,6 +709,14 @@ class PhotoEngine:
         face_cy = (face_top_y + face_bot_y) * 0.52
         face_rx = max(20.0, metrics.face_bbox_norm[2] * metrics.image_width * sx * 0.52)
         face_ry = max(25.0, (face_bot_y - face_top_y) * 0.56)
+        eye_dist_px = (
+            max(24.0, math.hypot(re_pt[0] - le_pt[0], re_pt[1] - le_pt[1]))
+            if (le_pt is not None and re_pt is not None)
+            else (face_rx * 0.85)
+        )
+        # Anatomically safe cheek half-width strictly INSIDE the ears (prevents ANY retouch/healing on ears!)
+        safe_cheek_rx = min(face_rx * 0.90, eye_dist_px * 1.00)
+        pimple_cheek_rx = min(face_rx * 0.84, eye_dist_px * 0.94)
 
         if metrics.mouth_rect:
             mx, my, mw, mh = metrics.mouth_rect
@@ -740,18 +748,18 @@ class PhotoEngine:
         roi_fg = fg_mask[roi_y0:roi_y1, roi_x0:roi_x1]
         yy, xx = np.mgrid[roi_y0:roi_y1, roi_x0:roi_x1].astype(np.float32)
 
-        # 1b. Surgical Automatic Pimple Removal (BEFORE smoothing/skin-tone polish so erythema contrast is cleanest!)
+        # 1b. Surgical Automatic Pimple Removal (strictly inside ear-safe cheek polygon & hair-eroded skin!)
         pimples_fixed = 0
         if settings.pimple_fix:
             p_valid = (
-                ((((xx - face_cx) / (face_rx * 0.94)) ** 2 + ((yy - face_cy) / (face_ry * 1.02)) ** 2) < 1.0)
+                ((((xx - face_cx) / pimple_cheek_rx) ** 2 + ((yy - face_cy) / (face_ry * 1.00)) ** 2) < 1.0)
                 & (roi_fg > 0.82)
             )
             for eye in [p for p in (le_pt, re_pt) if p is not None]:
                 ex, ey = eye
-                p_valid &= (((xx - ex) / (eye_r * 1.38)) ** 2 + ((yy - ey) / (eye_r * 1.05)) ** 2) > 1.0
-                p_valid &= (((xx - ex) / (eye_r * 1.58)) ** 2 + ((yy - (ey - eye_r * 0.95)) / (eye_r * 0.62)) ** 2) > 1.0
-            p_valid &= (((xx - mouth_cx) / (mouth_rx * 1.08)) ** 2 + ((yy - mouth_cy) / (mouth_ry * 1.12)) ** 2) > 1.0
+                p_valid &= (((xx - ex) / (eye_r * 1.42)) ** 2 + ((yy - ey) / (eye_r * 1.10)) ** 2) > 1.0
+                p_valid &= (((xx - ex) / (eye_r * 1.65)) ** 2 + ((yy - (ey - eye_r * 0.95)) / (eye_r * 0.68)) ** 2) > 1.0
+            p_valid &= (((xx - mouth_cx) / (mouth_rx * 1.10)) ** 2 + ((yy - mouth_cy) / (mouth_ry * 1.18)) ** 2) > 1.0
             if metrics.nose_rect:
                 nx, ny, nw, nh = metrics.nose_rect
                 nr_x0 = (nx - crop_left) * sx - nw * sx * 0.35
@@ -761,9 +769,13 @@ class PhotoEngine:
                 p_valid &= ~((xx >= nr_x0) & (xx <= nr_x1) & (yy >= nr_y0) & (yy <= nr_y1))
 
             lum0 = 0.299 * roi[:, :, 0] + 0.587 * roi[:, :, 1] + 0.114 * roi[:, :, 2]
-            p_valid &= (lum0 > 82.0) & (roi[:, :, 0] >= roi[:, :, 1] - 4.0) & (roi[:, :, 1] >= roi[:, :, 2] - 4.0)
+            is_skin0 = (lum0 > 88.0) & (roi[:, :, 0] >= roi[:, :, 1] - 2.0) & (roi[:, :, 1] >= roi[:, :, 2] - 4.0) & ((roi[:, :, 0] - roi[:, :, 2]) > 10.0)
+            hr = max(2, int(round(pimple_cheek_rx * 0.022)))
+            k_hair = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hr * 2 + 1, hr * 2 + 1))
+            p_valid &= (cv2.erode(is_skin0.astype(np.uint8) * 255, k_hair) > 0)
+
             roi_u8 = np.clip(np.rint(roi), 0, 255).astype(np.uint8)
-            healed_u8, pimples_fixed = self._detect_and_heal_pimples(roi_u8, p_valid, face_rx)
+            healed_u8, pimples_fixed = self._detect_and_heal_pimples(roi_u8, p_valid, pimple_cheek_rx)
             if pimples_fixed > 0:
                 roi = healed_u8.astype(np.float32)
 
@@ -771,8 +783,8 @@ class PhotoEngine:
             t = np.clip((val - e0) / (e1 - e0), 0.0, 1.0)
             return t * t * (3.0 - 2.0 * t)
 
-        # Face oval skin mask (excluding eyes, eyebrows, lips!)
-        f_dist = ((xx - face_cx) / (face_rx * 1.05)) ** 2 + ((yy - face_cy) / (face_ry * 1.12)) ** 2
+        # Face oval skin mask (strictly inside cheeks/jaw so ears NEVER get smoothed or smeared!)
+        f_dist = ((xx - face_cx) / safe_cheek_rx) ** 2 + ((yy - face_cy) / (face_ry * 1.06)) ** 2
         mask_w = smoothstep(1.0, 0.58, f_dist) * (roi_fg > 0.78).astype(np.float32)
 
         for eye in [p for p in (le_pt, re_pt) if p is not None]:
@@ -859,90 +871,132 @@ class PhotoEngine:
         roi_u8: np.ndarray, valid_skin: np.ndarray, face_rx: float
     ) -> Tuple[np.ndarray, int]:
         """
-        Detects ONLY clearly defined localized inflamed pimples (papules & whiteheads in red halo)
-        using surround-ring CIE-Lab a* + illumination-invariant erythema contrast. Preserves moles & pores.
-        Heals via seamless Laplace harmonic diffusion + adjacent skin pore micro-texture graft.
+        Scale-normalized, adaptive MAD Z-score pimple detector & harmonic frequency-separation healer.
+        Detects clearly defined inflamed pimples & papules strictly inside ear-safe facial skin,
+        preserves natural dark moles & pores, and applies gentle Pass-2 post-acne cheek calming when >=2 pimples exist.
         """
         h, w = roi_u8.shape[:2]
+        if int(valid_skin.sum()) < 80:
+            return roi_u8, 0
         out = roi_u8.astype(np.float32).copy()
 
-        lab = cv2.cvtColor(roi_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        # Canonical detection scale (~180px face_rx) for 100% consistent behavior across 3x4, Passport, 9x12 & 2x closeup
+        sc = min(1.0, 180.0 / max(1.0, face_rx))
+        if sc < 0.94:
+            dw, dh = max(64, int(round(w * sc))), max(64, int(round(h * sc)))
+            det_rgb = cv2.resize(roi_u8, (dw, dh), interpolation=cv2.INTER_AREA)
+            det_valid = cv2.resize(valid_skin.astype(np.uint8) * 255, (dw, dh), interpolation=cv2.INTER_NEAREST) > 0
+            det_frx = face_rx * (dw / float(w))
+        else:
+            dw, dh = w, h
+            det_rgb = roi_u8
+            det_valid = valid_skin
+            det_frx = face_rx
+
+        if int(det_valid.sum()) < 40:
+            return roi_u8, 0
+
+        df = det_rgb.astype(np.float32)
+        lab = cv2.cvtColor(det_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
         L, a_ch = lab[:, :, 0], lab[:, :, 1]
-        ery = (out[:, :, 0] - out[:, :, 1]) / (out[:, :, 0] + out[:, :, 1] + 20.0)
+        ery = (df[:, :, 0] - df[:, :, 1]) / (df[:, :, 0] + df[:, :, 1] + 20.0)
 
-        bg_r = max(7, int(round(face_rx * 0.11)))
+        bg_r = max(10, int(round(det_frx * 0.15)))
         bg_k = bg_r * 2 + 1
-        a_bg = cv2.GaussianBlur(a_ch, (bg_k, bg_k), bg_r * 0.42)
-        L_bg = cv2.GaussianBlur(L, (bg_k, bg_k), bg_r * 0.42)
-        ery_bg = cv2.GaussianBlur(ery, (bg_k, bg_k), bg_r * 0.42)
+        a_bg = cv2.GaussianBlur(a_ch, (bg_k, bg_k), bg_r * 0.45)
+        L_bg = cv2.GaussianBlur(L, (bg_k, bg_k), bg_r * 0.45)
+        ery_bg = cv2.GaussianBlur(ery, (bg_k, bg_k), bg_r * 0.45)
 
-        a_sm = cv2.GaussianBlur(a_ch, (3, 3), 0.7)
-        L_sm = cv2.GaussianBlur(L, (3, 3), 0.7)
-        ery_sm = cv2.GaussianBlur(ery, (3, 3), 0.7)
+        a_sm = cv2.GaussianBlur(a_ch, (3, 3), 0.8)
+        L_sm = cv2.GaussianBlur(L, (3, 3), 0.8)
+        ery_sm = cv2.GaussianBlur(ery, (3, 3), 0.8)
 
         da = a_sm - a_bg
         dery = ery_sm - ery_bg
         dL = L_bg - L_sm
 
-        cand = valid_skin & (da > 4.6) & (dery > 0.028) & ~((dL > 30.0) & (da < 10.0))
+        sig_a = max(1.05, float(np.median(np.abs(da[det_valid]))) * 1.4826)
+        sig_e = max(0.0065, float(np.median(np.abs(dery[det_valid]))) * 1.4826)
+        sig_L = max(2.2, float(np.median(np.abs(dL[det_valid]))) * 1.4826)
+
+        z_a = da / sig_a
+        z_e = dery / sig_e
+        z_L = dL / sig_L
+
+        is_dark_mole = (dL > 22.0) & (da < 8.0)
+        cand = det_valid & (~is_dark_mole) & (
+            ((z_a > 2.2) & (z_e > 2.0) & (da > 2.6))
+            | ((z_a > 1.7) & (z_L > 2.4) & (da > 2.0) & (dL > 6.5))
+        )
+
         k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        close_r = max(2, int(round(face_rx * 0.015)))
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_r * 2 + 1, close_r * 2 + 1))
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         cand_u8 = cv2.morphologyEx(cand.astype(np.uint8) * 255, cv2.MORPH_OPEN, k3)
-        cand_u8 = cv2.morphologyEx(cand_u8, cv2.MORPH_CLOSE, k_close)
+        cand_u8 = cv2.morphologyEx(cand_u8, cv2.MORPH_CLOSE, k5)
 
         n_lbl, labels, stats, centroids = cv2.connectedComponentsWithStats(cand_u8, connectivity=8)
 
-        face_w = face_rx * 2.0
-        min_d = max(4.0, face_w * 0.012)
-        max_d = max(14.0, face_w * 0.075)
+        face_w = det_frx * 2.0
+        min_d = max(3.2, face_w * 0.009)
+        max_d = max(16.0, face_w * 0.095)
         min_area = math.pi * (min_d * 0.5) ** 2 * 0.45
-        max_area = math.pi * (max_d * 0.5) ** 2 * 1.25
+        max_area = math.pi * (max_d * 0.5) ** 2 * 1.40
 
         detected: List[Tuple[float, float, int, int]] = []
+        inv_sc = w / float(dw)
         for l in range(1, n_lbl):
             area = float(stats[l, cv2.CC_STAT_AREA])
             bw = int(stats[l, cv2.CC_STAT_WIDTH])
             bh = int(stats[l, cv2.CC_STAT_HEIGHT])
             if area < min_area or area > max_area:
                 continue
-            if max(bw, bh) / max(1.0, min(bw, bh)) > 2.2:
+            if max(bw, bh) / max(1.0, min(bw, bh)) > 2.8:
                 continue
-            if area / float(max(1, bw * bh)) < 0.34:
+            if area / float(max(1, bw * bh)) < 0.28:
                 continue
 
             cx, cy = float(centroids[l][0]), float(centroids[l][1])
-            rad = max(3.5, math.sqrt(area / math.pi))
-            pad = int(math.ceil(rad * 2.8)) + 2
-            x0, x1 = max(0, int(cx) - pad), min(w, int(cx) + pad + 1)
-            y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
+            rad = max(2.8, math.sqrt(area / math.pi))
+            pad = int(math.ceil(rad * 3.0)) + 4
+            x0, x1 = max(0, int(cx) - pad), min(dw, int(cx) + pad + 1)
+            y0, y1 = max(0, int(cy) - pad), min(dh, int(cy) + pad + 1)
             py, px = np.mgrid[y0:y1, x0:x1]
             dist = np.hypot(px - cx, py - cy)
 
             in_red = (labels[y0:y1, x0:x1] == l) & cand[y0:y1, x0:x1]
-            if int(in_red.sum()) < 6:
+            if int(in_red.sum()) < 5:
                 continue
-            ring_m = (dist >= rad * 1.45) & (dist <= rad * 2.55) & valid_skin[y0:y1, x0:x1] & (cand_u8[y0:y1, x0:x1] == 0)
-            if int(ring_m.sum()) < 18:
+            ring_m = (dist >= rad * 1.45) & (dist <= rad * 2.95) & det_valid[y0:y1, x0:x1] & (cand_u8[y0:y1, x0:x1] == 0)
+            if int(ring_m.sum()) < 14:
                 continue
 
             ring_a = float(np.median(a_sm[y0:y1, x0:x1][ring_m]))
             ring_ery = float(np.median(ery_sm[y0:y1, x0:x1][ring_m]))
             ring_L = float(np.median(L_sm[y0:y1, x0:x1][ring_m]))
 
-            in_a_vals = a_sm[y0:y1, x0:x1][in_red]
-            in_e_vals = ery_sm[y0:y1, x0:x1][in_red]
-            in_L_vals = L_sm[y0:y1, x0:x1][in_red]
+            in_a = a_sm[y0:y1, x0:x1][in_red]
+            in_e = ery_sm[y0:y1, x0:x1][in_red]
+            in_L = L_sm[y0:y1, x0:x1][in_red]
 
-            p90_da = float(np.percentile(in_a_vals, 90)) - ring_a
-            mean_da = float(in_a_vals.mean()) - ring_a
-            p90_dE = float(np.percentile(in_e_vals, 90)) - ring_ery
-            mean_dL = ring_L - float(in_L_vals.mean())
+            p90_da = float(np.percentile(in_a, 90)) - ring_a
+            mean_da = float(in_a.mean()) - ring_a
+            p90_dE = float(np.percentile(in_e, 90)) - ring_ery
+            p90_dL = ring_L - float(np.percentile(in_L, 10))
+            mean_dL = ring_L - float(in_L.mean())
 
-            if p90_da >= 8.2 and mean_da >= 5.8 and p90_dE >= 0.052 and not (mean_dL > 28.0 and p90_da < 13.0):
-                rx_e = max(5, int(round(max(bw * 0.78, rad * 1.65))))
-                ry_e = max(5, int(round(max(bh * 0.78, rad * 1.65))))
-                detected.append((cx, cy, rx_e, ry_e))
+            za_p = p90_da / sig_a
+            ze_p = p90_dE / sig_e
+            zL_p = p90_dL / sig_L
+
+            is_red_outlier = (za_p >= 4.2 and ze_p >= 3.7 and p90_da >= 4.8 and mean_da >= 3.0)
+            is_papule_outlier = (za_p >= 3.1 and ze_p >= 2.8 and zL_p >= 3.6 and p90_da >= 3.6 and p90_dL >= 11.5)
+            is_mole = (mean_dL > 22.0 and p90_da < 9.5)
+
+            if (is_red_outlier or is_papule_outlier) and not is_mole:
+                max_r = max(8, int(round(face_rx * 0.085)))
+                rx_e = min(max_r, max(5, int(round(max(bw * 0.78, rad * 1.55) * inv_sc))))
+                ry_e = min(max_r, max(5, int(round(max(bh * 0.78, rad * 1.55) * inv_sc))))
+                detected.append((cx * inv_sc, cy * inv_sc, rx_e, ry_e))
 
         if not detected:
             return roi_u8, 0
@@ -956,33 +1010,62 @@ class PhotoEngine:
         heal_bin = np.where(valid_skin, heal_bin, 0).astype(np.uint8)
 
         healed_low = out.copy()
-        for (cx, cy, rx_e, ry_e) in detected:
-            pad = max(rx_e, ry_e) + 8
-            x0, x1 = max(1, int(cx) - pad), min(w - 1, int(cx) + pad + 1)
-            y0, y1 = max(1, int(cy) - pad), min(h - 1, int(cy) + pad + 1)
+        hn, hlabels, hstats, _ = cv2.connectedComponentsWithStats(heal_bin, connectivity=8)
+        for hl in range(1, hn):
+            hx, hy = int(hstats[hl, 0]), int(hstats[hl, 1])
+            hw_b, hh_b = int(hstats[hl, 2]), int(hstats[hl, 3])
+            pad = 10
+            x0, x1 = max(1, hx - pad), min(w - 1, hx + hw_b + pad)
+            y0, y1 = max(1, hy - pad), min(h - 1, hy + hh_b + pad)
             if x1 <= x0 or y1 <= y0:
                 continue
-            sub_m = heal_bin[y0:y1, x0:x1] > 0
+            sub_m = (hlabels[y0:y1, x0:x1] == hl)
             if not sub_m.any():
                 continue
             patch = healed_low[y0 - 1 : y1 + 1, x0 - 1 : x1 + 1].copy()
-            ring = (~sub_m) & valid_skin[y0:y1, x0:x1]
+            ring = (~sub_m) & valid_skin[y0:y1, x0:x1] & (heal_bin[y0:y1, x0:x1] == 0)
             if ring.any():
                 patch[1:-1, 1:-1][sub_m] = np.median(patch[1:-1, 1:-1][ring], axis=0)
-            for _ in range(40):
+            iters = min(85, max(45, max(hw_b, hh_b) * 2))
+            for _ in range(iters):
                 avg4 = 0.25 * (patch[:-2, 1:-1] + patch[2:, 1:-1] + patch[1:-1, :-2] + patch[1:-1, 2:])
                 patch[1:-1, 1:-1] = np.where(sub_m[..., None], avg4, patch[1:-1, 1:-1])
             healed_low[y0:y1, x0:x1] = patch[1:-1, 1:-1]
 
-        shift = max(8, int(round(face_rx * 0.07)))
+        shift = max(9, int(round(face_rx * 0.08)))
         donor_high = np.roll(high_orig, shift=shift, axis=1)
         donor_ok = np.roll(valid_skin & (heal_bin == 0), shift=shift, axis=1)
-        healed_tex = np.clip(healed_low + np.where(donor_ok[..., None], donor_high * 0.50, 0.0), 0.0, 255.0)
+        donor_high2 = np.roll(high_orig, shift=-shift, axis=1)
+        donor_ok2 = np.roll(valid_skin & (heal_bin == 0), shift=-shift, axis=1)
+        graft = np.where(donor_ok[..., None], donor_high * 0.50, np.where(donor_ok2[..., None], donor_high2 * 0.50, 0.0))
+        healed_tex = np.clip(healed_low + graft, 0.0, 255.0)
 
-        feather_r = max(3, int(round(face_rx * 0.016)))
+        feather_r = max(3, int(round(face_rx * 0.018)))
         alpha = cv2.GaussianBlur(heal_bin.astype(np.float32) / 255.0, (feather_r * 2 + 1, feather_r * 2 + 1), 0)
-        alpha = np.clip(alpha * 1.15, 0.0, 0.95)
+        alpha = np.clip(alpha * 1.15, 0.0, 0.94)
         res = out * (1.0 - alpha[..., None]) + healed_tex * alpha[..., None]
+
+        # Pass 2 (ONLY when >=2 real pimples detected): calm localized pink post-acne cheek blotches cleanly!
+        if len(detected) >= 2:
+            full_bg_r = max(10, int(round(face_rx * 0.16)))
+            full_bg_k = full_bg_r * 2 + 1
+            lab2 = cv2.cvtColor(np.clip(res, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+            a2_bg = cv2.GaussianBlur(lab2[:, :, 1], (full_bg_k, full_bg_k), full_bg_r * 0.50)
+            L2_bg = cv2.GaussianBlur(lab2[:, :, 0], (full_bg_k, full_bg_k), full_bg_r * 0.50)
+            not_mole2 = ~((L2_bg - lab2[:, :, 0] > 20.0) & (lab2[:, :, 1] - a2_bg < 6.0))
+            patch_red = np.clip((lab2[:, :, 1] - a2_bg - 1.3) / 4.0, 0.0, 1.0)
+            patch_dark = np.clip((L2_bg - lab2[:, :, 0] - 1.3) / 10.5, 0.0, 1.0)
+            blotch_w = np.clip(patch_red * (0.48 + 0.52 * patch_dark), 0.0, 1.0) * (valid_skin & not_mole2).astype(np.float32)
+            fk = max(3, int(round(face_rx * 0.018))) * 2 + 1
+            blotch_w = cv2.GaussianBlur(blotch_w, (fk, fk), 0)
+            lab2[:, :, 1] = lab2[:, :, 1] * (1.0 - blotch_w * 0.68) + a2_bg * (blotch_w * 0.68)
+            lab2[:, :, 0] = np.where(
+                lab2[:, :, 0] < L2_bg,
+                lab2[:, :, 0] * (1.0 - blotch_w * 0.45) + L2_bg * (blotch_w * 0.45),
+                lab2[:, :, 0],
+            )
+            res = cv2.cvtColor(np.clip(lab2, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+
         return np.clip(np.rint(res), 0, 255).astype(np.uint8), len(detected)
 
     # MARK: - 3. Render Complete Vertical 10x15 Sheet
