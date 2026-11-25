@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH)
 
@@ -18,17 +18,13 @@ hiddenimports = [
     "PySide6.QtPrintSupport",
 ]
 
-for pkg in ("mediapipe", "onnxruntime", "rawpy"):
+for pkg in ("mediapipe", "onnxruntime", "rawpy", "cv2"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
 
-binaries += collect_dynamic_libs("cv2")
-
 excludes = [
-    "tkinter",
-    "unittest",
     "pytest",
     "IPython",
     "jupyter",
@@ -79,7 +75,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    disable_windowed_traceback=False,
+    disable_windowed_traceback=True,
     icon=str(ROOT / "assets" / "app_icon.ico"),
     version=str(ROOT / "version_info.txt"),
 )

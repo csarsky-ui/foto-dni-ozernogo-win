@@ -16,13 +16,11 @@ if str(ROOT) not in sys.path:
 
 def make_synthetic_portrait(path: Path) -> None:
     img = np.full((1200, 900, 3), 238, dtype=np.uint8)
-    # Torso & head oval silhouette so RMBG-1.4 has a clear foreground subject
     yy, xx = np.mgrid[0:1200, 0:900]
     head = ((xx - 450) / 145.0) ** 2 + ((yy - 430) / 195.0) ** 2 <= 1.0
     body = ((xx - 450) / 310.0) ** 2 + ((yy - 980) / 360.0) ** 2 <= 1.0
     img[body] = [68, 76, 62]
     img[head] = [212, 174, 152]
-    # Simple eye circles
     for ex in (395, 505):
         eye = (xx - ex) ** 2 + (yy - 405) ** 2 <= 14 ** 2
         img[eye] = [40, 48, 55]
@@ -54,6 +52,7 @@ def main() -> int:
         src = tmp / "smoke_in.jpg"
         out_psd = tmp / "smoke_out.psd"
         out_jpg = tmp / "smoke_out.jpg"
+        log_file = tmp / "exe_run.log"
         make_synthetic_portrait(src)
 
         if args.phase == "pre":
@@ -80,8 +79,14 @@ def main() -> int:
                 str(out_psd),
                 "--jpg",
                 str(out_jpg),
+                "--log",
+                str(log_file),
             ]
-            res = subprocess.run(cmd, check=False)
+            res = subprocess.run(cmd, check=False, timeout=120)
+            if log_file.is_file():
+                print("=== EXE LOG ===")
+                print(log_file.read_text(encoding="utf-8", errors="replace"))
+                print("=== END EXE LOG ===")
             if res.returncode != 0:
                 raise RuntimeError(f"EXE exited with code {res.returncode}")
             verify_outputs(out_psd, out_jpg)
