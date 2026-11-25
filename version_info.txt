@@ -1,0 +1,32 @@
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '041904B0',
+          [
+            StringStruct('CompanyName', 'Газета «Дни Озёрного»'),
+            StringStruct('FileDescription', 'Фото на документы — подготовка 10×15 см (PSD, JPEG, EPSON L8050)'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'FotoDniOzernogo'),
+            StringStruct('OriginalFilename', 'FotoDniOzernogo.exe'),
+            StringStruct('ProductName', 'Фото на документы — Дни Озёрного'),
+            StringStruct('ProductVersion', '1.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1049, 1200])])
+  ]
+)

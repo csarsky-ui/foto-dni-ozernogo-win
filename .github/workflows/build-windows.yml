@@ -1,0 +1,85 @@
+name: Build Windows EXE (Foto na dokumenty)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11 (64-bit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download offline AI models (MediaPipe + RMBG-1.4 quantized)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+
+          curl.exe -fL --retry 4 --retry-delay 5 `
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" `
+            -o "models/face_landmarker.task"
+
+          curl.exe -fL --retry 4 --retry-delay 5 `
+            "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx" `
+            -o "models/rmbg_1_4_q.onnx"
+
+          $faceSize = (Get-Item "models/face_landmarker.task").Length
+          $rmbgSize = (Get-Item "models/rmbg_1_4_q.onnx").Length
+          Write-Host "face_landmarker.task: $faceSize bytes"
+          Write-Host "rmbg_1_4_q.onnx:      $rmbgSize bytes"
+          if ($faceSize -lt 3000000) { throw "face_landmarker.task download incomplete!" }
+          if ($rmbgSize -lt 40000000) { throw "rmbg_1_4_q.onnx download incomplete!" }
+
+      - name: Pre-build Python smoke test (imports + engine + PSD writer)
+        shell: pwsh
+        run: python scripts/ci_smoke.py --phase pre
+
+      - name: Build standalone Windows folder with PyInstaller
+        shell: pwsh
+        run: pyinstaller --clean --noconfirm FotoDniOzernogo.spec
+
+      - name: Verify compiled FotoDniOzernogo.exe end-to-end
+        shell: pwsh
+        run: python scripts/ci_smoke.py --phase exe --exe dist/FotoDniOzernogo/FotoDniOzernogo.exe
+
+      - name: Copy user guide into distribution folder and create ZIP
+        shell: pwsh
+        run: |
+          Copy-Item "README.md" "dist\FotoDniOzernogo\ИНСТРУКЦИЯ.txt"
+          Compress-Archive -Path "dist\FotoDniOzernogo" -DestinationPath "FotoDniOzernogo-Windows-x64.zip" -Force
+          $zipMB = [math]::Round((Get-Item "FotoDniOzernogo-Windows-x64.zip").Length / 1MB, 1)
+          Write-Host "Archive ready: FotoDniOzernogo-Windows-x64.zip ($zipMB MB)"
+
+      - name: Upload Windows ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FotoDniOzernogo-Windows-x64
+          path: FotoDniOzernogo-Windows-x64.zip
+          retention-days: 90
+
+      - name: Publish GitHub Release (on tag push v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: FotoDniOzernogo-Windows-x64.zip
