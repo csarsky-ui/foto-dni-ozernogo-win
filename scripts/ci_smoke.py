@@ -68,36 +68,99 @@ def main() -> int:
             eng.export_jpeg(sheet, out_jpg)
             verify_outputs(out_psd, out_jpg)
 
-            # Also verify async PySide6 MainWindow.load_file() + QThread render end-to-end!
+            # Also verify async PySide6 MainWindow load -> preset switch -> corner/cut/logo switch ->
+            # portrait closeup mode -> second photo reload end-to-end!
             os.environ["QT_QPA_PLATFORM"] = "offscreen"
-            from PySide6.QtCore import QTimer
+            from PySide6.QtCore import QEventLoop, QTimer
             from PySide6.QtWidgets import QApplication
+            from app.models import CornerStyle, CutMarkStyle, LogoStyle
             from app.ui import MainWindow
 
             qt_app = QApplication.instance() or QApplication([])
             win = MainWindow()
-            state = {"rendered": False, "error": None}
-            orig_render = win._on_render_done
-            orig_fail = win._on_photo_failed
 
-            def on_render(*a):
-                orig_render(*a)
-                state["rendered"] = True
-                qt_app.quit()
+            def wait_for_render(action_fn, timeout_ms: int = 30000) -> str:
+                res = {"done": False, "mode": None, "err": None}
+                loop = QEventLoop()
 
-            def on_fail(err):
-                state["error"] = err
-                qt_app.quit()
+                def on_ok(gen, mode, _obj):
+                    if gen == win._render_gen:
+                        res["done"] = True
+                        res["mode"] = mode
+                        loop.quit()
 
-            win._on_render_done = on_render
-            win._on_photo_failed = on_fail
-            QTimer.singleShot(30000, qt_app.quit)
-            win.load_file(src)
-            qt_app.exec()
+                def on_rfail(gen, err):
+                    if gen == win._render_gen:
+                        res["err"] = f"render: {err}"
+                        loop.quit()
+
+                def on_lfail(gen, err):
+                    if gen == win._load_gen:
+                        res["err"] = f"load: {err}"
+                        loop.quit()
+
+                win._render_thread.rendered_ok.connect(on_ok)
+                win._render_thread.failed.connect(on_rfail)
+                win._loader_thread.failed.connect(on_lfail)
+                timer = QTimer()
+                timer.setSingleShot(True)
+                timer.timeout.connect(loop.quit)
+                timer.start(timeout_ms)
+                try:
+                    action_fn()
+                    loop.exec()
+                finally:
+                    timer.stop()
+                    win._render_thread.rendered_ok.disconnect(on_ok)
+                    win._render_thread.failed.disconnect(on_rfail)
+                    win._loader_thread.failed.disconnect(on_lfail)
+
+                assert res["err"] is None, f"GUI step failed: {res['err']}"
+                assert res["done"], "GUI step timed out before rendering!"
+                assert "Ошибка" not in win.lbl_status.text(), f"Unexpected error status: {win.lbl_status.text()}"
+                assert win.canvas._loading_text is None, f"Loading overlay stuck: {win.canvas._loading_text}"
+                return str(res["mode"])
+
+            # 1) Initial photo load -> sheet render
+            m1 = wait_for_render(lambda: win.load_file(src))
+            assert m1 == "sheet", f"Expected sheet mode, got {m1}"
+
+            # 2) Switch preset via QComboBox (reproduces PySide6 str-Enum bug!)
+            m2 = wait_for_render(lambda: win.cmb_preset.setCurrentIndex(1))
+            assert m2 == "sheet"
+            assert isinstance(win.settings.preset, PhotoFormatPreset), f"preset type broken: {type(win.settings.preset)}"
+            assert win.settings.preset == PhotoFormatPreset.PASSPORT_RF
+
+            # 3) Switch corner, cut marks, logo via QComboBox + check suggested filename
+            wait_for_render(lambda: (
+                win.cmb_corner.setCurrentIndex(1),
+                win.cmb_cut.setCurrentIndex(1),
+                win.cmb_logo.setCurrentIndex(1),
+            ))
+            assert isinstance(win.settings.corner_style, CornerStyle)
+            assert isinstance(win.settings.cut_marks, CutMarkStyle)
+            assert isinstance(win.settings.logo_style, LogoStyle)
+            assert "_ugolokR" in win._suggested_base_name()
+
+            # 4) Switch to full closeup portrait preview mode ("Крупно портрет")
+            m4 = wait_for_render(lambda: win._set_preview_mode("portrait"))
+            assert m4 == "portrait", f"Expected portrait mode, got {m4}"
+
+            # 5) Switch preset to COMBO while in portrait mode, then back to sheet
+            m5 = wait_for_render(lambda: win.cmb_preset.setCurrentIndex(len(list(PhotoFormatPreset)) - 1))
+            assert m5 == "portrait"
+            assert win.settings.preset == PhotoFormatPreset.COMBO
+            m6 = wait_for_render(lambda: win._set_preview_mode("sheet"))
+            assert m6 == "sheet"
+
+            # 6) Reload a second photo sequentially on the same persistent AI loader thread
+            src2 = tmp / "smoke_in_2.jpg"
+            make_synthetic_portrait(src2)
+            m7 = wait_for_render(lambda: win.load_file(src2))
+            assert m7 == "sheet"
+
             win.close()
-            assert state["error"] is None, f"GUI load failed: {state['error']}"
-            assert state["rendered"], "GUI load_file() timed out before rendering!"
-            print("GUI ASYNC LOAD + RENDER OK")
+            print("GUI ASYNC LOAD + PRESET + PORTRAIT + RELOAD OK")
         else:
             if not args.exe or not args.exe.is_file():
                 raise FileNotFoundError(f"Built EXE not found: {args.exe}")

@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
+import traceback
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal
@@ -60,6 +63,18 @@ from .print_win import (
 )
 
 
+def _log_runtime_error(context: str, tb_text: str) -> None:
+    try:
+        base = Path(os.environ.get("APPDATA", str(Path.home()))) if sys.platform == "win32" else (Path.home() / ".config")
+        log_path = base / "FotoDniOzernogo" / "app.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n[{stamp}] {context}\n{tb_text}\n")
+    except Exception:
+        pass
+
+
 def rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     arr = np.ascontiguousarray(rgb, dtype=np.uint8)
     h, w, _ = arr.shape
@@ -67,53 +82,102 @@ def rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-class _LoadThread(QThread):
-    loaded_ok = Signal(object)
-    failed = Signal(str)
-    progress = Signal(str)
+class _LoaderThread(QThread):
+    """Single persistent background worker thread for RAW decoding + MediaPipe + RMBG-1.4.
+    Keeping AI sessions pinned to ONE persistent OS thread avoids Windows thread-local /
+    XNNPACK / ONNX Runtime threadpool deadlocks when loading multiple photos in a session.
+    """
 
-    def __init__(self, engine: PhotoEngine, path: Path, parent: Optional[QObject] = None) -> None:
+    loaded_ok = Signal(int, object)    # load_gen, LoadedPhoto
+    failed = Signal(int, str)          # load_gen, error_message
+    progress = Signal(int, str)        # load_gen, status_message
+
+    def __init__(self, engine: PhotoEngine, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.engine = engine
-        self.path = path
+        self._cond = threading.Condition()
+        self._pending: Optional[Tuple[int, Path]] = None
+        self._stop = False
+
+    def submit(self, gen: int, path: Path) -> None:
+        with self._cond:
+            self._pending = (gen, path)
+            self._cond.notify()
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stop = True
+            self._pending = None
+            self._cond.notify()
 
     def run(self) -> None:
-        try:
-            loaded = self.engine.load_photo(self.path, progress_cb=self.progress.emit)
-            self.loaded_ok.emit(loaded)
-        except Exception as exc:
-            self.failed.emit(str(exc))
+        while True:
+            with self._cond:
+                while self._pending is None and not self._stop:
+                    self._cond.wait()
+                if self._stop:
+                    return
+                item = self._pending
+                self._pending = None
+            if item is None:
+                continue
+            gen, path = item
+            try:
+                loaded = self.engine.load_photo(
+                    path,
+                    progress_cb=lambda msg, g=gen: self.progress.emit(g, msg),
+                )
+                self.loaded_ok.emit(gen, loaded)
+            except Exception as exc:
+                _log_runtime_error(f"load_photo({path})", traceback.format_exc())
+                self.failed.emit(gen, str(exc))
 
 
 class _RenderThread(QThread):
+    """Single persistent background render worker that always processes the latest settings snapshot."""
+
     rendered_ok = Signal(int, str, object)  # gen, mode, RenderedSheet | PortraitPreviewResult
     failed = Signal(int, str)
 
-    def __init__(
-        self,
-        engine: PhotoEngine,
-        gen: int,
-        mode: str,
-        photo: LoadedPhoto,
-        settings: EditSettings,
-        parent: Optional[QObject] = None,
-    ) -> None:
+    def __init__(self, engine: PhotoEngine, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.engine = engine
-        self.gen = gen
-        self.mode = mode
-        self.photo = photo
-        self.settings = settings
+        self._cond = threading.Condition()
+        self._pending: Optional[Tuple[int, str, LoadedPhoto, EditSettings]] = None
+        self._stop = False
+
+    def submit(self, gen: int, mode: str, photo: LoadedPhoto, settings: EditSettings) -> None:
+        with self._cond:
+            self._pending = (gen, mode, photo, settings)
+            self._cond.notify()
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stop = True
+            self._pending = None
+            self._cond.notify()
 
     def run(self) -> None:
-        try:
-            if self.mode == "sheet":
-                res = self.engine.render_sheet(self.photo, self.settings)
-            else:
-                res = self.engine.render_closeup_portrait(self.photo, self.settings)
-            self.rendered_ok.emit(self.gen, self.mode, res)
-        except Exception as exc:
-            self.failed.emit(self.gen, str(exc))
+        while True:
+            with self._cond:
+                while self._pending is None and not self._stop:
+                    self._cond.wait()
+                if self._stop:
+                    return
+                item = self._pending
+                self._pending = None
+            if item is None:
+                continue
+            gen, mode, photo, settings = item
+            try:
+                if mode == "sheet":
+                    res = self.engine.render_sheet(photo, settings)
+                else:
+                    res = self.engine.render_closeup_portrait(photo, settings)
+                self.rendered_ok.emit(gen, mode, res)
+            except Exception as exc:
+                _log_runtime_error(f"render({mode})", traceback.format_exc())
+                self.failed.emit(gen, str(exc))
 
 
 class PreviewCanvas(QWidget):
@@ -294,9 +358,20 @@ class MainWindow(QMainWindow):
         self.current_sheet: Optional[RenderedSheet] = None
         self.last_saved_psd: Optional[Path] = None
         self.preview_mode = "sheet"
+        self._load_gen = 0
         self._render_gen = 0
-        self._active_threads: list[QThread] = []
         self._updating_ui = False
+
+        self._loader_thread = _LoaderThread(self.engine, parent=self)
+        self._loader_thread.progress.connect(self._on_load_progress)
+        self._loader_thread.loaded_ok.connect(self._on_photo_loaded)
+        self._loader_thread.failed.connect(self._on_photo_failed)
+        self._loader_thread.start()
+
+        self._render_thread = _RenderThread(self.engine, parent=self)
+        self._render_thread.rendered_ok.connect(self._on_render_done)
+        self._render_thread.failed.connect(self._on_render_failed)
+        self._render_thread.start()
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -418,7 +493,7 @@ class MainWindow(QMainWindow):
         gl = QVBoxLayout(g_fmt)
         self.cmb_preset = QComboBox()
         for p in PhotoFormatPreset:
-            self.cmb_preset.addItem(p.title, p)
+            self.cmb_preset.addItem(p.title, p.value)
         self.cmb_preset.currentIndexChanged.connect(self._on_preset_changed)
         gl.addWidget(self.cmb_preset)
         self.lbl_preset_sub = QLabel(self.settings.preset.subtitle)
@@ -450,7 +525,7 @@ class MainWindow(QMainWindow):
         row_cor.addWidget(QLabel("Уголок:"))
         self.cmb_corner = QComboBox()
         for c in CornerStyle:
-            self.cmb_corner.addItem(c.title, c)
+            self.cmb_corner.addItem(c.title, c.value)
         self.cmb_corner.currentIndexChanged.connect(self._on_controls_changed)
         row_cor.addWidget(self.cmb_corner, 1)
         gl.addLayout(row_cor)
@@ -523,7 +598,7 @@ class MainWindow(QMainWindow):
         row_cut.addWidget(QLabel("Метки реза:"))
         self.cmb_cut = QComboBox()
         for m in CutMarkStyle:
-            self.cmb_cut.addItem(m.title, m)
+            self.cmb_cut.addItem(m.title, m.value)
         self.cmb_cut.currentIndexChanged.connect(self._on_controls_changed)
         row_cut.addWidget(self.cmb_cut, 1)
         gl.addLayout(row_cut)
@@ -532,7 +607,7 @@ class MainWindow(QMainWindow):
         row_logo.addWidget(QLabel("Логотип внизу:"))
         self.cmb_logo = QComboBox()
         for l in LogoStyle:
-            self.cmb_logo.addItem(l.title, l)
+            self.cmb_logo.addItem(l.title, l.value)
         self.cmb_logo.currentIndexChanged.connect(self._on_controls_changed)
         row_logo.addWidget(self.cmb_logo, 1)
         gl.addLayout(row_logo)
@@ -660,7 +735,8 @@ class MainWindow(QMainWindow):
     def _on_preset_changed(self) -> None:
         if self._updating_ui:
             return
-        preset: PhotoFormatPreset = self.cmb_preset.currentData()
+        raw = self.cmb_preset.currentData()
+        preset = PhotoFormatPreset(raw) if raw is not None else PhotoFormatPreset.F3X4_6
         self.settings.preset = preset
         self.lbl_preset_sub.setText(preset.subtitle)
         self._updating_ui = True
@@ -671,7 +747,8 @@ class MainWindow(QMainWindow):
     def _on_controls_changed(self) -> None:
         if self._updating_ui:
             return
-        self.settings.corner_style = self.cmb_corner.currentData()
+        c_raw = self.cmb_corner.currentData()
+        self.settings.corner_style = CornerStyle(c_raw) if c_raw is not None else CornerStyle.NONE
         self.settings.white_background = self.chk_white_bg.isChecked()
         self.settings.mask_clean_strength = self.sl_mask.value() / 100.0
 
@@ -694,8 +771,10 @@ class MainWindow(QMainWindow):
         self.settings.extra_rotation_deg = self.sl_rot.value() / 10.0
 
         self.settings.gap_mm = self.sl_gap.value() / 10.0
-        self.settings.cut_marks = self.cmb_cut.currentData()
-        self.settings.logo_style = self.cmb_logo.currentData()
+        cut_raw = self.cmb_cut.currentData()
+        self.settings.cut_marks = CutMarkStyle(cut_raw) if cut_raw is not None else CutMarkStyle.FRAME_AND_TICKS
+        logo_raw = self.cmb_logo.currentData()
+        self.settings.logo_style = LogoStyle(logo_raw) if logo_raw is not None else LogoStyle.AUTO
 
         self.settings.print_copies = self.spn_copies.value()
         self.settings.print_rotate_180 = self.chk_rot180.isChecked()
@@ -739,19 +818,18 @@ class MainWindow(QMainWindow):
         self.canvas.set_loading(f"Декодирую {path.name} и строю AI-маску…")
         self.lbl_status.setText(f"Загрузка {path.name}…")
 
-        thread = _LoadThread(self.engine, path, parent=self)
-        thread.progress.connect(self._on_load_progress)
-        thread.loaded_ok.connect(self._on_photo_loaded)
-        thread.failed.connect(self._on_photo_failed)
-        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
-        self._active_threads.append(thread)
-        thread.start()
+        self._load_gen += 1
+        self._loader_thread.submit(self._load_gen, path)
 
-    def _on_load_progress(self, msg: str) -> None:
+    def _on_load_progress(self, gen: int, msg: str) -> None:
+        if gen != self._load_gen:
+            return
         self.canvas.set_loading(msg)
         self.lbl_status.setText(msg)
 
-    def _on_photo_loaded(self, loaded: LoadedPhoto) -> None:
+    def _on_photo_loaded(self, gen: int, loaded: LoadedPhoto) -> None:
+        if gen != self._load_gen:
+            return
         self.loaded_photo = loaded
         self.btn_save_psd.setEnabled(True)
         self.btn_save_jpg.setEnabled(True)
@@ -759,9 +837,12 @@ class MainWindow(QMainWindow):
         deg = loaded.metrics.eye_roll_rad * 180.0 / 3.14159265
         face_note = f"лицо найдено, выравнивание {deg:+.1f}°" if loaded.metrics.detected_face else "лицо не распознано"
         self.lbl_status.setText(f"{loaded.path.name} · {loaded.metrics.image_width}×{loaded.metrics.image_height} · {face_note}")
+        self.canvas.set_loading("Готовлю предпросмотр…")
         self._schedule_render(immediate=True)
 
-    def _on_photo_failed(self, err: str) -> None:
+    def _on_photo_failed(self, gen: int, err: str) -> None:
+        if gen != self._load_gen:
+            return
         self.canvas.set_loading(None)
         self.lbl_status.setText("Ошибка загрузки файла")
         QMessageBox.critical(self, "Ошибка открытия файла", err)
@@ -780,14 +861,9 @@ class MainWindow(QMainWindow):
             return
         self._render_gen += 1
         gen = self._render_gen
-        # Snapshot dataclass copy for thread safety
+        # Snapshot dataclass copy for thread safety (coerces all enums via __post_init__)
         snap = EditSettings(**self.settings.__dict__)
-        thread = _RenderThread(self.engine, gen, self.preview_mode, self.loaded_photo, snap, parent=self)
-        thread.rendered_ok.connect(self._on_render_done)
-        thread.failed.connect(self._on_render_failed)
-        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
-        self._active_threads.append(thread)
-        thread.start()
+        self._render_thread.submit(gen, self.preview_mode, self.loaded_photo, snap)
 
     def _on_render_done(self, gen: int, mode: str, result: object) -> None:
         if gen != self._render_gen:
@@ -828,6 +904,7 @@ class MainWindow(QMainWindow):
     def _on_render_failed(self, gen: int, err: str) -> None:
         if gen != self._render_gen:
             return
+        self.canvas.set_loading(None)
         self.lbl_status.setText(f"Ошибка рендеринга: {err}")
 
     def _update_metrics_ui(
@@ -852,15 +929,14 @@ class MainWindow(QMainWindow):
             self.lbl_pimple_status.setText("Явных прыщей не обнаружено")
             self.lbl_pimple_status.setStyleSheet("color: #777; font-size: 11px;")
 
-    def _cleanup_thread(self, thread: QThread) -> None:
-        if thread in self._active_threads:
-            self._active_threads.remove(thread)
-        thread.deleteLater()
-
     def closeEvent(self, event) -> None:
-        for t in list(self._active_threads):
-            if t.isRunning():
-                t.wait(5000)
+        self._render_timer.stop()
+        self._loader_thread.stop()
+        self._render_thread.stop()
+        if self._loader_thread.isRunning():
+            self._loader_thread.wait(5000)
+        if self._render_thread.isRunning():
+            self._render_thread.wait(5000)
         super().closeEvent(event)
 
     # MARK: - Export & Printing

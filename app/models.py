@@ -326,6 +326,18 @@ class EditSettings:
     # Mask edge
     mask_clean_strength: float = 0.50
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.preset, PhotoFormatPreset):
+            self.preset = PhotoFormatPreset(self.preset)
+        if not isinstance(self.color_mode, ColorMode):
+            self.color_mode = ColorMode(self.color_mode)
+        if not isinstance(self.corner_style, CornerStyle):
+            self.corner_style = CornerStyle(self.corner_style)
+        if not isinstance(self.cut_marks, CutMarkStyle):
+            self.cut_marks = CutMarkStyle(self.cut_marks)
+        if not isinstance(self.logo_style, LogoStyle):
+            self.logo_style = LogoStyle(self.logo_style)
+
     def reset_photo_tweaks(self) -> None:
         self.zoom = 1.0
         self.shift_y = 0.0

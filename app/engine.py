@@ -4,6 +4,7 @@ import io
 import math
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -121,7 +122,14 @@ class PhotoEngine:
         self.srgb_icc_path = (self.assets_dir / "sRGB.icc") if self.assets_dir else None
 
         self._rmbg_session: Optional[ort.InferenceSession] = None
+        self._rmbg_input_name: str = "input"
         self._face_landmarker = None
+        self._ai_lock = threading.Lock()
+        try:
+            cpu_cnt = os.cpu_count() or 2
+            cv2.setNumThreads(max(1, min(4, cpu_cnt // 2 if cpu_cnt >= 4 else 1)))
+        except Exception:
+            pass
 
     def _load_rgba(self, filename: str) -> Optional[np.ndarray]:
         if not self.assets_dir:
@@ -132,39 +140,50 @@ class PhotoEngine:
         return np.array(Image.open(p).convert("RGBA"), dtype=np.uint8)
 
     def _ensure_models(self) -> None:
-        if self._rmbg_session is None:
-            if not self.models_dir:
-                raise RuntimeError("Папка models/ не найдена.")
-            model_path = self.models_dir / "rmbg_1_4_q.onnx"
-            if not model_path.is_file():
-                raise RuntimeError(f"Не найдена модель отделения фона: {model_path}")
-            opts = ort.SessionOptions()
-            # Use physical-core friendly thread count on Windows CPUs to avoid hyperthread contention
-            cpu_cnt = os.cpu_count() or 4
-            opts.intra_op_num_threads = max(1, min(4, cpu_cnt // 2 if cpu_cnt >= 4 else cpu_cnt))
-            opts.inter_op_num_threads = 1
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            # Load from bytes to avoid C++ ANSI path issues with Cyrillic folders on Windows
-            self._rmbg_session = ort.InferenceSession(
-                model_path.read_bytes(), sess_options=opts, providers=["CPUExecutionProvider"]
-            )
+        with self._ai_lock:
+            if self._rmbg_session is None:
+                if not self.models_dir:
+                    raise RuntimeError("Папка models/ не найдена.")
+                model_path = self.models_dir / "rmbg_1_4_q.onnx"
+                if not model_path.is_file():
+                    raise RuntimeError(f"Не найдена модель отделения фона: {model_path}")
+                opts = ort.SessionOptions()
+                # Prevent Windows CPU threadpool spin-wait deadlocks / contention with OpenMP, MediaPipe & OpenCV
+                cpu_cnt = os.cpu_count() or 2
+                opts.intra_op_num_threads = max(1, min(4, cpu_cnt // 2 if cpu_cnt >= 4 else 1))
+                opts.inter_op_num_threads = 1
+                opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                opts.enable_mem_pattern = False
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+                try:
+                    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+                except Exception:
+                    pass
+                # Load from bytes to avoid C++ ANSI path issues with Cyrillic folders on Windows
+                self._rmbg_session = ort.InferenceSession(
+                    model_path.read_bytes(), sess_options=opts, providers=["CPUExecutionProvider"]
+                )
+                inputs = self._rmbg_session.get_inputs()
+                if inputs:
+                    self._rmbg_input_name = inputs[0].name
 
-        if self._face_landmarker is None:
-            assert self.models_dir is not None
-            task_path = self.models_dir / "face_landmarker.task"
-            if not task_path.is_file():
-                raise RuntimeError(f"Не найдена модель лица MediaPipe: {task_path}")
-            base_opts = mp_python.BaseOptions(model_asset_buffer=task_path.read_bytes())
-            options = mp_vision.FaceLandmarkerOptions(
-                base_options=base_opts,
-                running_mode=mp_vision.RunningMode.IMAGE,
-                num_faces=1,
-                min_face_detection_confidence=0.35,
-                min_face_presence_confidence=0.35,
-                output_face_blendshapes=False,
-                output_facial_transformation_matrixes=False,
-            )
-            self._face_landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+            if self._face_landmarker is None:
+                assert self.models_dir is not None
+                task_path = self.models_dir / "face_landmarker.task"
+                if not task_path.is_file():
+                    raise RuntimeError(f"Не найдена модель лица MediaPipe: {task_path}")
+                base_opts = mp_python.BaseOptions(model_asset_buffer=task_path.read_bytes())
+                options = mp_vision.FaceLandmarkerOptions(
+                    base_options=base_opts,
+                    running_mode=mp_vision.RunningMode.IMAGE,
+                    num_faces=1,
+                    min_face_detection_confidence=0.35,
+                    min_face_presence_confidence=0.35,
+                    output_face_blendshapes=False,
+                    output_facial_transformation_matrixes=False,
+                )
+                self._face_landmarker = mp_vision.FaceLandmarker.create_from_options(options)
 
     # MARK: - 1. Load RAW / Image + MediaPipe Face Landmarks + RMBG-1.4 Mask
     def load_photo(
@@ -295,7 +314,8 @@ class PhotoEngine:
         else:
             small = rgb
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(small))
-        result = self._face_landmarker.detect(mp_img)
+        with self._ai_lock:
+            result = self._face_landmarker.detect(mp_img)
         if result and result.face_landmarks:
             return result.face_landmarks[0]
         return None
@@ -317,8 +337,9 @@ class PhotoEngine:
         assert self._rmbg_session is not None
         H, W = rgb.shape[:2]
         inp = cv2.resize(rgb, (1024, 1024), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0 - 0.5
-        inp = np.transpose(inp, (2, 0, 1))[None, ...]
-        out = self._rmbg_session.run(None, {"input": inp})[0][0, 0]
+        inp = np.ascontiguousarray(np.transpose(inp, (2, 0, 1))[None, ...], dtype=np.float32)
+        with self._ai_lock:
+            out = self._rmbg_session.run(None, {self._rmbg_input_name: inp})[0][0, 0]
         lo, hi = float(out.min()), float(out.max())
         if hi - lo > 1e-6:
             out = (out - lo) / (hi - lo)

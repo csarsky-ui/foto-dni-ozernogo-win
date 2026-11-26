@@ -7,6 +7,10 @@ import time
 import traceback
 from pathlib import Path
 
+# Prevent OpenMP / ONNX busy-spin contention with Qt GUI threads on Windows CPUs
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+
 # Guard stdout/stderr for windowed (console=False) PyInstaller builds on Windows
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
@@ -105,6 +109,16 @@ def run_cli(argv: list[str]) -> int:
 
 def main() -> int:
     explicit_log = _extract_log_path(sys.argv[1:])
+
+    def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _write_crash_log(tb, explicit_log=explicit_log)
+        try:
+            sys.stderr.write(tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _global_excepthook
     try:
         if "--cli" in sys.argv:
             idx = sys.argv.index("--cli")
